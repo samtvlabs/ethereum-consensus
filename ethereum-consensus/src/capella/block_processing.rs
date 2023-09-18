@@ -1,17 +1,21 @@
 use crate::{
     capella::{
-        compute_timestamp_at_slot, get_current_epoch, get_randao_mix, process_attestation,
+        compute_timestamp_at_slot, decrease_balance, get_current_epoch, get_randao_mix, helpers::*,
+        presets::mainnet::MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP, process_attestation,
         process_attester_slashing, process_block_header, process_deposit, process_eth1_data,
         process_proposer_slashing, process_randao, process_sync_aggregate, process_voluntary_exit,
         BeaconBlock, BeaconBlockBody, BeaconState, ExecutionEngine, ExecutionPayload,
         ExecutionPayloadHeader, NewPayloadRequest, SignedBlsToExecutionChange,
     },
+    phase0::mainnet::MAX_EFFECTIVE_BALANCE,
     state_transition::{
         invalid_operation_error, Context, InvalidDeposit, InvalidExecutionPayload,
         InvalidOperation, Result,
     },
 };
 use ssz_rs::prelude::*;
+
+use super::{ExecutionAddress, Withdrawal};
 
 pub fn process_bls_to_execution_change<
     const SLOTS_PER_HISTORICAL_ROOT: usize,
@@ -225,6 +229,75 @@ pub fn process_execution_payload<
     Ok(())
 }
 
+pub fn get_expected_withdrawals<
+    const SLOTS_PER_HISTORICAL_ROOT: usize,
+    const HISTORICAL_ROOTS_LIMIT: usize,
+    const ETH1_DATA_VOTES_BOUND: usize,
+    const VALIDATOR_REGISTRY_LIMIT: usize,
+    const EPOCHS_PER_HISTORICAL_VECTOR: usize,
+    const EPOCHS_PER_SLASHINGS_VECTOR: usize,
+    const MAX_VALIDATORS_PER_COMMITTEE: usize,
+    const SYNC_COMMITTEE_SIZE: usize,
+    const BYTES_PER_LOGS_BLOOM: usize,
+    const MAX_EXTRA_DATA_BYTES: usize,
+    const MAX_BYTES_PER_TRANSACTION: usize,
+    const MAX_TRANSACTIONS_PER_PAYLOAD: usize,
+    const MAX_WITHDRAWALS_PER_PAYLOAD: usize,
+>(
+    state: &BeaconState<
+        SLOTS_PER_HISTORICAL_ROOT,
+        HISTORICAL_ROOTS_LIMIT,
+        ETH1_DATA_VOTES_BOUND,
+        VALIDATOR_REGISTRY_LIMIT,
+        EPOCHS_PER_HISTORICAL_VECTOR,
+        EPOCHS_PER_SLASHINGS_VECTOR,
+        MAX_VALIDATORS_PER_COMMITTEE,
+        SYNC_COMMITTEE_SIZE,
+        BYTES_PER_LOGS_BLOOM,
+        MAX_EXTRA_DATA_BYTES,
+    >,
+    context: &Context,
+) -> Result<Vec<Withdrawal>> {
+    let epoch = get_current_epoch(state, context);
+    let mut withdrawal_index = state.next_withdrawal_index;
+    let mut validator_index = state.next_withdrawal_validator_index;
+    let mut withdrawals: Vec<Withdrawal> = Vec::new();
+    let bound = usize::min(state.validators.len(), MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP);
+
+    for _ in 0..bound {
+        let validator = &state.validators[validator_index];
+        let balance = state.balances[validator_index];
+
+        if is_fully_withdrawable_validator(validator, balance, epoch) {
+            withdrawals.push(Withdrawal {
+                index: withdrawal_index,
+                validator_index,
+                address: ExecutionAddress::try_from(&validator.withdrawal_credentials[12..32])
+                    .expect("Failed to parse address"),
+                amount: balance,
+            });
+            withdrawal_index += 1;
+        } else if is_partially_withdrawable_validator(validator, balance, context) {
+            withdrawals.push(Withdrawal {
+                index: withdrawal_index,
+                validator_index,
+                address: ExecutionAddress::try_from(&validator.withdrawal_credentials[12..])
+                    .expect("Failed to parse address"),
+                amount: balance - MAX_EFFECTIVE_BALANCE,
+            });
+            withdrawal_index += 1;
+        }
+
+        if withdrawals.len() == MAX_WITHDRAWALS_PER_PAYLOAD {
+            break
+        }
+
+        validator_index = (validator_index + 1) % state.validators.len();
+    }
+
+    Ok(withdrawals)
+}
+
 pub fn process_withdrawals<
     const SLOTS_PER_HISTORICAL_ROOT: usize,
     const HISTORICAL_ROOTS_LIMIT: usize,
@@ -240,7 +313,7 @@ pub fn process_withdrawals<
     const MAX_TRANSACTIONS_PER_PAYLOAD: usize,
     const MAX_WITHDRAWALS_PER_PAYLOAD: usize,
 >(
-    _state: &mut BeaconState<
+    state: &mut BeaconState<
         SLOTS_PER_HISTORICAL_ROOT,
         HISTORICAL_ROOTS_LIMIT,
         ETH1_DATA_VOTES_BOUND,
@@ -252,16 +325,55 @@ pub fn process_withdrawals<
         BYTES_PER_LOGS_BLOOM,
         MAX_EXTRA_DATA_BYTES,
     >,
-    _execution_payload: &ExecutionPayload<
+    payload: &ExecutionPayload<
         BYTES_PER_LOGS_BLOOM,
         MAX_EXTRA_DATA_BYTES,
         MAX_BYTES_PER_TRANSACTION,
         MAX_TRANSACTIONS_PER_PAYLOAD,
         MAX_WITHDRAWALS_PER_PAYLOAD,
     >,
-    _context: &Context,
+    context: &Context,
 ) -> Result<()> {
-    unimplemented!()
+    let expected_withdrawals = get_expected_withdrawals::<
+        SLOTS_PER_HISTORICAL_ROOT,
+        HISTORICAL_ROOTS_LIMIT,
+        ETH1_DATA_VOTES_BOUND,
+        VALIDATOR_REGISTRY_LIMIT,
+        EPOCHS_PER_HISTORICAL_VECTOR,
+        EPOCHS_PER_SLASHINGS_VECTOR,
+        MAX_VALIDATORS_PER_COMMITTEE,
+        SYNC_COMMITTEE_SIZE,
+        BYTES_PER_LOGS_BLOOM,
+        MAX_EXTRA_DATA_BYTES,
+        MAX_BYTES_PER_TRANSACTION,
+        MAX_TRANSACTIONS_PER_PAYLOAD,
+        MAX_WITHDRAWALS_PER_PAYLOAD,
+    >(state, context)?;
+    assert_eq!(payload.withdrawals.len(), expected_withdrawals.len());
+
+    for (expected_withdrawal, withdrawal) in
+        expected_withdrawals.iter().zip(payload.withdrawals.iter())
+    {
+        assert_eq!(withdrawal, expected_withdrawal);
+        decrease_balance(state, withdrawal.validator_index, withdrawal.amount);
+    }
+    if !expected_withdrawals.is_empty() {
+        let latest_withdrawal = expected_withdrawals.last().unwrap();
+        state.next_withdrawal_index = latest_withdrawal.index + 1;
+    }
+
+    if expected_withdrawals.len() == MAX_WITHDRAWALS_PER_PAYLOAD {
+        let next_validator_index =
+            (expected_withdrawals.last().unwrap().validator_index + 1) % state.validators.len();
+        state.next_withdrawal_validator_index = next_validator_index;
+    } else {
+        let next_index =
+            state.next_withdrawal_validator_index + MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP;
+        let next_validator_index = next_index % state.validators.len();
+        state.next_withdrawal_validator_index = next_validator_index;
+    }
+
+    Ok(())
 }
 
 pub fn process_block<
